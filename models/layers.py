@@ -6,9 +6,41 @@ import torch.nn.functional as F
 
 try:
     from flash_attn_interface import flash_attn_func  # type: ignore[import]
+    HAS_FLASH_ATTN = True
 except ImportError:
-    # Fallback to FlashAttention 2
-    from flash_attn import flash_attn_func  # type: ignore[import]
+    try:
+        # Fallback to FlashAttention 2
+        from flash_attn import flash_attn_func  # type: ignore[import]
+        HAS_FLASH_ATTN = True
+    except ImportError:
+        # Final fallback to standard attention
+        print("Warning: flash_attn not available, using standard attention")
+        HAS_FLASH_ATTN = False
+        
+        def flash_attn_func(q, k, v, causal=False):
+            """Fallback standard attention implementation"""
+            # q, k, v: [batch_size, seq_len, num_heads, head_dim]
+            B, T, H, D = q.shape
+            
+            # Transpose to [batch_size, num_heads, seq_len, head_dim]
+            q = q.transpose(1, 2)  # [B, H, T, D]
+            k = k.transpose(1, 2)  # [B, H, T, D]
+            v = v.transpose(1, 2)  # [B, H, T, D]
+            
+            # Standard scaled dot-product attention
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (D ** 0.5)
+            
+            if causal:
+                # Apply causal mask
+                mask = torch.tril(torch.ones(T, T, device=q.device, dtype=torch.bool))
+                scores = scores.masked_fill(~mask, float('-inf'))
+            
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            
+            # Transpose back to [batch_size, seq_len, num_heads, head_dim]
+            attn_output = attn_output.transpose(1, 2)
+            return attn_output
 
 from models.common import trunc_normal_init_
 
@@ -131,8 +163,8 @@ class Attention(nn.Module):
         if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
             attn_output = attn_output[0]
 
-        # attn_output: [batch_size, num_heads, seq_len, head_dim]
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        # attn_output: [batch_size, seq_len, num_heads, head_dim] from fallback or [batch_size, seq_len, num_heads, head_dim] from flash_attn
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
 

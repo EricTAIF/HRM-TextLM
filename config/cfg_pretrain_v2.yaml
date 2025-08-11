@@ -1,0 +1,54 @@
+# Enhanced HRM V2 Training Configuration
+# Optimized for stability and performance
+
+defaults:
+  - arch: hrm_v2
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data path
+data_path: data/text-large-1024
+
+# Task type
+task: text_lm
+
+# Enhanced training hyperparameters for stability
+global_batch_size: 32
+epochs: 4
+eval_interval: 50  # More frequent evaluation
+
+# Optimized learning rate settings
+lr: 5e-5  # Reduced from 1e-4 for stability
+lr_min_ratio: 0.1
+lr_warmup_steps: 500
+lr_schedule: "cosine_with_restarts"
+lr_restart_period: 1000
+
+# Enhanced optimizer settings
+beta1: 0.9
+beta2: 0.999  # Increased for stability
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+puzzle_emb_lr: 1e-2
+
+# Gradient management
+grad_clip_norm: 1.0
+grad_accum_steps: 1
+
+# Enhanced loss configuration
+loss_type: "stable_cross_entropy"
+label_smoothing: 0.05  # Light regularization
+
+# Enhanced checkpointing
+checkpoint_every_eval: true
+checkpoint_every_minutes: 30  # Every 30 minutes
+
+# Monitoring and logging
+monitor_gradients: true
+log_frequency: 10
+wandb_project: "HRM-V2-Text-LM"
+
+# Stability settings
+seed: 42

@@ -1,0 +1,38 @@
+# Enhanced HRM v2 Architecture Configuration
+# Stability improvements and advanced features
+
+name: "hrm.hrm_act_v2@HierarchicalReasoningModel_ACTV2"
+
+# Core architecture
+hidden_size: 1024
+expansion: 2.5
+num_heads: 16
+
+# Hierarchical cycles (reduced for stability)
+H_cycles: 3  # Reduced from 4
+L_cycles: 3  # Reduced from 4
+
+# Layer counts
+H_layers: 4
+L_layers: 4
+
+# Enhanced positional encodings
+pos_encodings: "hybrid"  # RoPE + ALiBi for better extrapolation
+
+# ACT configuration (more conservative)
+halt_max_steps: 3  # Reduced for stability
+halt_exploration_prob: 0.1  # Reduced exploration
+
+# V2 Enhancements
+gradient_checkpointing: true
+alibi_max_bias: 8.0
+act_loss_weight: 0.1  # Reduced from 0.5
+use_peri_ln: true
+
+# Numerical stability
+rms_norm_eps: 1e-6
+forward_dtype: "bfloat16"
+rope_theta: 10000.0
+
+# Memory optimization
+checkpoint_activations: true

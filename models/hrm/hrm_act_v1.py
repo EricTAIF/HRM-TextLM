@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from models.text_embedding import TextEmbedding
 
 
 @dataclass
@@ -55,6 +56,14 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     halt_exploration_prob: float
 
     forward_dtype: str = "bfloat16"
+    
+    # Task type
+    task: str = "puzzle"
+    pad_token_id: int = 0
+
+
+def build_causal_mask(T: int, device):
+    return torch.tril(torch.ones(T, T, device=device, dtype=torch.bool)).unsqueeze(0).unsqueeze(0)  # [1,1,T,T]
 
 
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
@@ -66,7 +75,7 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
             head_dim=config.hidden_size // config.num_heads,
             num_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
-            causal=False
+            causal=(config.task == "text_lm")  # Enable causal attention for text LM
         )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
@@ -109,15 +118,31 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_scale  = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # Determine if this is text LM mode
+        self.is_text_lm = getattr(config, "task", "puzzle") == "text_lm"
+        
+        if self.is_text_lm:
+            self.input_embed = TextEmbedding(
+                vocab_size=self.config.vocab_size,
+                d_model=self.config.hidden_size,
+                max_len=self.config.seq_len,
+                pad_token_id=getattr(self.config, "pad_token_id", 0),
+                pos_encodings=self.config.pos_encodings,
+            )
+            self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        else:
+            self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+            self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+            
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
-        if self.config.puzzle_emb_ndim > 0:
-            # Zero init puzzle embeddings
+        if self.config.puzzle_emb_ndim > 0 and not self.is_text_lm:
+            # Zero init puzzle embeddings (only for puzzle tasks)
             self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
                                                     batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
+        elif self.is_text_lm:
+            self.puzzle_emb_len = 0  # No puzzle embeddings for text
 
         # LM Blocks
         if self.config.pos_encodings == "rope":
@@ -144,31 +169,46 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             self.q_head.bias.fill_(-5)  # type: ignore
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        if self.is_text_lm:
+            # For text LM, input contains input_ids directly
+            embedding = self.input_embed(input.to(torch.int32))  # [B, T, H]
+            # Adjust time dimension to model seq_len by padding/truncating
+            B, T, H = embedding.shape
+            if T < self.config.seq_len:
+                pad_T = self.config.seq_len - T
+                embedding = torch.nn.functional.pad(embedding, (0, 0, 0, pad_T))  # pad time dim to the right
+            elif T > self.config.seq_len:
+                embedding = embedding[:, -self.config.seq_len:, :]
+            # Ensure forward dtype (fp16/bf16) for FlashAttention compatibility
+            return self.embed_scale * embedding.to(self.forward_dtype)
+        else:
+            # Original puzzle embedding logic
+            # Token embedding
+            embedding = self.embed_tokens(input.to(torch.int32))
 
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
-            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            # Puzzle embeddings
+            if self.config.puzzle_emb_ndim > 0 and hasattr(self, 'puzzle_emb'):
+                puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
+                
+                pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+                if pad_count > 0:
+                    puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+                embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
 
-        # Position embeddings
-        if self.config.pos_encodings == "learned":
-            # scale by 1/sqrt(2) to maintain forward variance
-            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
+            # Position embeddings
+            if self.config.pos_encodings == "learned":
+                # scale by 1/sqrt(2) to maintain forward variance
+                embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
-        # Scale
-        return self.embed_scale * embedding
+            # Scale
+            return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        device = self.H_init.device
         return HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype, device=device),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
@@ -177,25 +217,46 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], return_trace: bool = False):
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
-        # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        # Causal attention is handled in the attention layer initialization
+
+        # Input encoding  
+        input_key = "input_ids" if "input_ids" in batch else "inputs"
+        puzzle_ids = batch.get("puzzle_identifiers", torch.zeros_like(batch[input_key][:, :1]))
+        input_embeddings = self._input_embeddings(batch[input_key], puzzle_ids)
 
         # Forward iterations
+        trace = [] if return_trace else None
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
 
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
-                    if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
+                    last_combo = (_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)
+                    if not last_combo:
                         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                        if return_trace:
+                            # record per-token norm for z_L
+                            trace.append({
+                                "level": "L",
+                                "h": _H_step,
+                                "l": _L_step,
+                                "z_norm": z_L.norm(dim=-1).to(torch.float32).cpu(),  # [B, T]
+                            })
 
-                if not (_H_step == self.config.H_cycles - 1):
+                if _H_step != self.config.H_cycles - 1:
                     z_H = self.H_level(z_H, z_L, **seq_info)
+                    if return_trace:
+                        trace.append({
+                            "level": "H",
+                            "h": _H_step,
+                            "l": None,
+                            "z_norm": z_H.norm(dim=-1).to(torch.float32).cpu(),
+                        })
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
@@ -205,12 +266,16 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        
+        if self.is_text_lm:
+            output = self.lm_head(z_H)  # For text LM, return full sequence logits
+        else:
+            output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
 
         # Q head
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return (new_carry, output, (q_logits[..., 0], q_logits[..., 1]), trace)
 
 
 class HierarchicalReasoningModel_ACTV1(nn.Module):
@@ -226,15 +291,20 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         return self.inner.puzzle_emb
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        batch_size = batch["inputs"].shape[0]
+        # Handle both "inputs" (puzzle) and "input_ids" (text) keys
+        input_key = "input_ids" if "input_ids" in batch else "inputs"
+        input_tensor = batch[input_key]
+        batch_size = input_tensor.shape[0]
+        device = input_tensor.device
 
         return HierarchicalReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            inner_carry=self.inner.empty_carry(batch_size),  # allocated on model device
             
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            # Only include tensor entries from batch for current_data
+            current_data={k: torch.empty_like(v, device=device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
         )
         
     def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
@@ -246,13 +316,8 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
-
-        outputs = {
-            "logits": logits,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
-        }
+        return_trace = bool(batch.get("debug_trace", False))
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), trace = self.inner(new_inner_carry, new_current_data, return_trace=return_trace)
         
         with torch.no_grad():
             # Step
@@ -276,8 +341,26 @@ class HierarchicalReasoningModel_ACTV1(nn.Module):
                 # NOTE: No replay buffer and target networks for computing target Q-value.
                 # As batch_size is large, there're many parallel envs.
                 # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
+                next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data, return_trace=False)[-1]
                 
-                outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+                outputs_target_q_continue = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+
+        # Package outputs (after computing steps/halted)
+        outputs = {
+            "logits": logits,
+            "q_halt_logits": q_halt_logits,
+            "q_continue_logits": q_continue_logits,
+            # Debug/visualization-friendly extras (use current carry tensors)
+            "z_H": new_inner_carry.z_H,
+            "z_L": new_inner_carry.z_L,
+            "steps": new_steps,
+            "halted": halted,
+        }
+        # Re-run inner with tracing if requested via outer API through loss head
+        # We detect this in losses head; here we only include trace if already computed above.
+        if trace is not None:
+            outputs["trace"] = trace
+        if self.training and (self.config.halt_max_steps > 1):
+            outputs["target_q_continue"] = outputs_target_q_continue  # type: ignore[name-defined]
 
         return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs

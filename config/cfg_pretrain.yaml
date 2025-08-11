@@ -10,16 +10,23 @@ hydra:
 # Data path
 data_path: data/arc-aug-1000
 
+# Task type: "puzzle" or "text_lm"
+task: puzzle
+
 # Hyperparams - Training
 global_batch_size: 768
 
 epochs: 100000
 eval_interval: 10000
 checkpoint_every_eval: True
+checkpoint_every_minutes: null
 
 lr: 1e-4
 lr_min_ratio: 1.0
 lr_warmup_steps: 2000
+
+# Training stability
+max_grad_norm: null
 
 # Standard hyperparameter settings for LM, as used in Llama
 beta1: 0.9
